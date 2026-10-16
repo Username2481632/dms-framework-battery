@@ -1,0 +1,10 @@
+// Allow wheel members to run ectool via pkexec without re-authenticating.
+// Lets the DankBar battery widget set the Framework EC charge limit
+// (pkexec ectool fwchargelimit N) without a password dialog per change.
+polkit.addRule(function (action, subject) {
+    if (action.id === "org.freedesktop.policykit.exec"
+        && action.lookup("program") === "/usr/bin/ectool"
+        && subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});

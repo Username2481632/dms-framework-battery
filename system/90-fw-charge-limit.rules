@@ -1,0 +1,2 @@
+# Start fw-charge-limit.service once the Framework EC's character device exists
+SUBSYSTEM=="misc", KERNEL=="cros_ec", TAG+="systemd", ENV{SYSTEMD_WANTS}+="fw-charge-limit.service"

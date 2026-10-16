@@ -1,0 +1,16 @@
+# Saves the charge limit before every sleep by stopping fw-charge-limit.service, and
+# restores it after resume by starting it again — after hibernation, the first moment
+# the BIOS's overwrite can be undone.
+[Unit]
+Description=Carry the Framework EC battery charge limit across sleep and hibernation
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/systemctl stop fw-charge-limit.service
+ExecStop=/usr/bin/systemctl start fw-charge-limit.service
+
+[Install]
+WantedBy=sleep.target

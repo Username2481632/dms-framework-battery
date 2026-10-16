@@ -1,0 +1,17 @@
+# The BIOS writes its own Setup charge limit into the Framework EC on every POST —
+# cold boot, reboot and resume from hibernation — so a limit set from Linux lasts
+# only until the next one. This unit saves the EC's limit when it stops and puts it
+# back when it starts. 90-fw-charge-limit.rules starts it once the EC's device
+# exists, shutdown stops it, and fw-charge-limit-sleep.service stops and restarts it
+# around every sleep.
+[Unit]
+Description=Keep the Framework EC battery charge limit across reboots
+Documentation=https://github.com/FrameworkComputer/framework-system/issues/25
+After=dev-cros_ec.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StateDirectory=fw-charge-limit
+ExecStart=/bin/sh -c 'f="$$STATE_DIRECTORY/limit"; [ ! -s "$$f" ] || exec /usr/bin/ectool fwchargelimit "$$(cat "$$f")"'
+ExecStop=/bin/sh -c 'v=$$(/usr/bin/ectool fwchargelimit) && [ "$$v" -ge 20 ] && [ "$$v" -le 100 ] && echo "$$v" > "$$STATE_DIRECTORY/limit.new" && mv "$$STATE_DIRECTORY/limit.new" "$$STATE_DIRECTORY/limit"'

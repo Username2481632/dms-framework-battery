@@ -1,12 +1,11 @@
-import Quickshell
-import Quickshell.Services.UPower
-import Quickshell.Io
-import qs.Common
-import qs.Widgets
-import qs.Modules.Plugins
-import qs.Services
 import QtQuick
 import QtQuick.Layouts
+import Quickshell
+import Quickshell.Io
+import qs.Common
+import qs.Services
+import qs.DCommon.Widgets
+import qs.Modules.Plugins
 
 PluginComponent {
     id: root
@@ -17,218 +16,188 @@ PluginComponent {
     property bool showWatts: pluginData.showWatts ?? false
     property bool showChargeLimit: pluginData.showChargeLimit ?? true
 
-    property var iconName: BatteryService.getBatteryIcon()
+    readonly property var presets: [50, 60, 70, 80, 90, 100]
+    // The EC rejects a limit below 20; ectool passes anything through
+    readonly property int minimumLimit: 20
 
-    property int chargeLimit: SettingsData.batteryChargeLimit
-    property bool chargeLimitCustom: ![60, 70, 80, 90, 100].includes(chargeLimit)
+    // The limit as the EC last reported it; -1 until the first read succeeds
+    property int chargeLimit: -1
+    property int pendingLimit: -1
+    property string limitError: ""
+    property int _exitCode: -1
+    readonly property bool busy: ecProcess.running
+    readonly property int shownLimit: pendingLimit >= 0 ? pendingLimit : chargeLimit
+    readonly property bool limiting: showChargeLimit && chargeLimit > 0 && chargeLimit < 100
 
-    property var statsModel: [
-        {
-            label: "Health",
-            value: BatteryService.batteryHealth
-        },
-        {
-            label: "Capacity",
-            value: BatteryService.batteryCapacity.toFixed(1) + " Wh"
-        },
-        {
-            label: "Watts",
-            value: (BatteryService.isCharging || BatteryService.isPluggedIn) && BatteryService.changeRate ? "+" : "-" + BatteryService.changeRate.toFixed(1) + " W"
+    // null follows the limit itself; "preset" or "custom" is the user's pick while the popout is open
+    property var limitMode: null
+    readonly property bool customMode: limitMode !== null ? limitMode === "custom" : (shownLimit > 0 && !presets.includes(shownLimit))
+
+    readonly property real rate: BatteryService.signedChangeRate
+    readonly property bool holding: BatteryService.isPluggedIn && rate === 0 && limiting
+    readonly property string powerText: rate === 0 ? "" : (rate > 0 ? "+" : "−") + Math.abs(rate).toFixed(1) + " W"
+
+    // DMS's own smoothed estimate runs to 100%; while a limit applies, charging stops
+    // at the limit, so the estimate is scaled to the share of the remaining energy
+    // that lies below it.
+    readonly property string timeText: {
+        if (rate < 0) {
+            const left = BatteryService.formatTimeRemaining();
+            return left === "Unknown" ? "" : left;
         }
-    ]
-
-    /**
-    * Sets the power profile
-    *
-    * @param {PowerProfile} profile
-    */
-    function setProfile(profile) {
-        if (typeof PowerProfiles === "undefined") {
-            ToastService.showError(I18n.tr("power-profiles-daemon not available"));
-            return;
+        if (rate > 0) {
+            const toFull = BatteryService.estimatedSeconds();
+            const capacity = BatteryService.batteryCapacity;
+            const energy = BatteryService.batteryEnergy;
+            const target = (limiting ? chargeLimit : 100) / 100 * capacity;
+            if (!toFull || capacity <= energy || target <= energy)
+                return "";
+            return BatteryService.formatDuration(toFull * (target - energy) / (capacity - energy));
         }
-        PowerProfiles.profile = profile;
-        if (PowerProfiles.profile !== profile) {
-            ToastService.showError(I18n.tr("Failed to set power profile"));
-        }
+        return "";
     }
 
-    /**
-    * Checks if the power profile is active
-    *
-    * @param {PowerProfile} profile
-    */
-    function isActiveProfile(profile) {
-        if (typeof PowerProfiles === "undefined") {
-            return false;
-        }
-
-        return PowerProfiles.profile === profile;
+    // The EC holds the charge between five points under the limit and the limit, and
+    // drains the battery on AC when it is above it.
+    readonly property string statusText: {
+        if (holding)
+            return "Held at the " + chargeLimit + "% limit";
+        if (BatteryService.isPluggedIn && rate < 0 && limiting)
+            return "Draining to the " + chargeLimit + "% limit";
+        if (rate > 0 && timeText)
+            return "Charging · " + timeText + (limiting ? " to " + chargeLimit + "%" : " to full");
+        if (rate < 0 && timeText)
+            return "Discharging · " + timeText + " left";
+        return BatteryService.batteryStatus;
     }
 
-    /**
-    * Sets the charge limit in DMS settings
-    *
-    * @param {int} limit
-    */
-    function setChargeLimit(limit) {
-        chargeLimit = limit
-
-        chargeLimitCustom = ![60, 80, 100].includes(limit)
-
-        SettingsData.set("batteryChargeLimit", limit)
-        SettingsData.saveSettings()
-    }
-
-    /**
-    * Sets the charge limit to the battery controller
-    *
-    * @param {int} limit
-    */
-    function setHardwareChargeLimit(limit) {
-        var process = chargeLimitProcessComponent.createObject(root, {
-            limit: limit
-        });
-
-        process.running = true;
-    }
-
-    /**
-    * Gets the charge limit from the battery controller
-    */
-    function getHardwareChargeLimit() {
-        var process = getChargeLimitProcessComponent.createObject(root);
-
-        process.running = true;
-    }
-    
-    /**
-    * Gets the battery icon color
-    */
-    function getBatteryIconColor() {
-        if (BatteryService.isLowBattery && !BatteryService.isCharging) {
+    readonly property color levelColor: {
+        if (BatteryService.isLowBattery && !BatteryService.isCharging)
             return Theme.error;
-        }
-        if (BatteryService.isCharging || BatteryService.isPluggedIn) {
+        if (BatteryService.isCharging || BatteryService.isPluggedIn)
             return Theme.primary;
-        }
         return Theme.surfaceText;
     }
 
-    // Process for setting the charge limit
-    Component {
-        id: chargeLimitProcessComponent
+    readonly property var stats: [
+        {
+            "label": "Health",
+            "value": BatteryService.batteryHealth
+        },
+        {
+            "label": "Capacity",
+            "value": BatteryService.batteryCapacity > 0 ? BatteryService.batteryCapacity.toFixed(1) + " Wh" : "N/A"
+        },
+        {
+            "label": "Power",
+            "value": powerText || "0 W"
+        }
+    ]
 
-        Process {
-            property int limit: 100
+    // `ectool fwchargelimit [N]` sets the limit when given one and always prints the
+    // limit the EC holds afterwards, so a write reports its own outcome.
+    function runEc(limit) {
+        if (ecProcess.running)
+            return;
+        pendingLimit = limit ?? -1;
+        _exitCode = -1;
+        ecProcess.command = ["pkexec", "ectool", "fwchargelimit"].concat(limit !== undefined ? [String(limit)] : []);
+        ecProcess.running = true;
+    }
 
-            command: [
-                "pkexec",
-                "ectool",
-                "fwchargelimit",
-                limit.toString()
-            ]
+    function setChargeLimit(limit) {
+        limitMode = null;
+        runEc(limit);
+    }
 
-            stdout: SplitParser {
-                onRead: line => console.log("ectool:", line)
-            }
-
-            stderr: SplitParser {
-                onRead: line => {
-                    if (line.trim()) {
-                        ToastService.showError("ectool error", line)
-                    }
-                }
-            }
-
-            onExited: (exitCode) => {
-                if (exitCode !== 0) {
-                    ToastService.showError("Failed to set charge limit (" + exitCode + ")")
-                    destroy()
-                    return
-                }
-
-                setChargeLimit(limit);
-
-                destroy()
-            }
+    function finishEc() {
+        const out = stdoutCollector.text.trim();
+        const detail = stderrCollector.text.trim() || out;
+        const action = pendingLimit >= 0 ? "set the charge limit to " + pendingLimit + "%" : "read the charge limit";
+        pendingLimit = -1;
+        if (_exitCode === 0 && /^\d+$/.test(out)) {
+            chargeLimit = parseInt(out);
+            limitError = "";
+            return;
+        }
+        switch (_exitCode) {
+        case -1:
+            limitError = "Couldn't " + action + ": pkexec could not be started.";
+            break;
+        case 126:
+            limitError = "Couldn't " + action + ": authentication was dismissed.";
+            break;
+        case 127:
+            limitError = "Couldn't " + action + ": pkexec refused, or ectool is missing" + (detail ? " (" + detail + ")" : "") + ".";
+            break;
+        default:
+            limitError = "Couldn't " + action + (detail ? ": " + detail : " (exit " + _exitCode + ")") + ".";
         }
     }
 
-    // Process for getting the charge limit
-    Component {
-        id: getChargeLimitProcessComponent
-
-        Process {
-            property int limit: 100
-
-            command: [
-                "pkexec",
-                "ectool",
-                "fwchargelimit",
-            ]
-
-            stdout: SplitParser {
-                onRead: line => console.log("ectool:", line)
-            }
-
-            stderr: SplitParser {
-                onRead: line => {
-                    if (line.trim()) {
-                        ToastService.showError("ectool error", line)
-                    }
-                }
-            }
-
-            onExited: exitCode => {
-                if (exitCode !== 0) {
-                    console.error("Failed to get charge limit")
-                    destroy()
-                    return
-                }
-
-                // Extract first number from output
-                let match = output.match(/(\d+)/)
-
-                if (match) {
-                    let limit = parseInt(match[1])
-
-                    console.log("Detected charge limit:", limit)
-
-                    root.chargeLimit = limit;
-                    setChargeLimit(limit);
-                }
-
-                destroy()
-            }
+    // Quickshell ends both output streams before `exited`, and `running` turns false
+    // after it — or alone, when the command could not be started at all.
+    Process {
+        id: ecProcess
+        stdout: StdioCollector {
+            id: stdoutCollector
         }
+        stderr: StdioCollector {
+            id: stderrCollector
+        }
+        onExited: exitCode => root._exitCode = exitCode
+        onRunningChanged: {
+            if (!running)
+                root.finishEc();
+        }
+    }
+
+    function setProfile(profile) {
+        if (!PowerProfileWatcher.applyProfile(profile))
+            ToastService.showError(PowerProfileWatcher.available ? "Failed to set power profile" : "power-profiles-daemon not available");
+    }
+
+    // The limit is read when the widget loads and again whenever the popout opens, so
+    // what it shows is what the EC holds even after something else has changed it.
+    Component.onCompleted: {
+        if (showChargeLimit)
+            runEc();
+    }
+
+    onInteractionActiveChanged: {
+        if (!interactionActive) {
+            limitMode = null;
+            return;
+        }
+        if (showChargeLimit)
+            runEc();
     }
 
     horizontalBarPill: Component {
         RowLayout {
             spacing: Theme.spacingXS
 
-            DankIcon {
+            DIcon {
                 name: BatteryService.getBatteryIcon()
                 size: Theme.iconSizeSmall
-                color: getBatteryIconColor()
+                color: root.levelColor
             }
 
             StyledText {
-                text: BatteryService.batteryLevel + "%"
+                text: Math.round(BatteryService.batteryLevel) + "%"
                 font.pixelSize: Theme.fontSizeSmall
             }
 
             StyledText {
-                text: BatteryService.formatTimeRemaining()
-                visible: showTimeRemaining && !(BatteryService.formatTimeRemaining() === "Unknown")
+                text: root.timeText
+                visible: root.showTimeRemaining && root.timeText !== ""
                 opacity: 0.7
                 font.pixelSize: Theme.fontSizeSmall
             }
 
             StyledText {
-                text: (BatteryService.isCharging || BatteryService.isPluggedIn) && BatteryService.changeRate ? "+" : "-" + BatteryService.changeRate.toFixed(1) + "W"
-                visible: showWatts && BatteryService.changeRate
+                text: root.powerText
+                visible: root.showWatts && root.powerText !== ""
                 opacity: 0.7
                 font.pixelSize: Theme.fontSizeSmall
             }
@@ -239,119 +208,88 @@ PluginComponent {
         ColumnLayout {
             spacing: Theme.spacingXS
 
-            DankIcon {
+            DIcon {
                 name: BatteryService.getBatteryIcon()
                 size: Theme.iconSizeSmall
-                color: getBatteryIconColor()
+                color: root.levelColor
+                Layout.alignment: Qt.AlignHCenter
             }
 
             StyledText {
-                text: BatteryService.batteryLevel + "%"
+                text: Math.round(BatteryService.batteryLevel) + "%"
                 font.pixelSize: Theme.fontSizeSmall
+                Layout.alignment: Qt.AlignHCenter
             }
 
             StyledText {
-                text: BatteryService.isCharging || BatteryService.isPluggedIn ? "+" : "-" + BatteryService.changeRate.toFixed(1) + "W"
-                visible: showWatts && BatteryService.changeRate
+                text: root.powerText
+                visible: root.showWatts && root.powerText !== ""
                 opacity: 0.7
                 font.pixelSize: Theme.fontSizeSmall
+                Layout.alignment: Qt.AlignHCenter
             }
         }
     }
 
     popoutContent: Component {
         PopoutComponent {
-            id: popoutColumn
-
             Item {
                 width: parent.width
                 implicitHeight: content.implicitHeight + Theme.spacingL * 2
 
-                // Main content layout
                 ColumnLayout {
                     id: content
-                    
+
                     x: Theme.spacingL
                     y: Theme.spacingL
                     width: parent.width - Theme.spacingL * 2
-
                     spacing: Theme.spacingL
 
-                    // Header
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: Theme.spacingM
 
-                        DankIcon {
+                        DIcon {
                             name: BatteryService.getBatteryIcon()
                             size: Theme.iconSizeLarge
-                            color: getBatteryIconColor()
+                            color: root.levelColor
                         }
 
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: Theme.spacingXS
 
-                            RowLayout {
-                                spacing: Theme.spacingS
-
-                                StyledText {
-                                    text: BatteryService.batteryLevel + "%"
-                                    font.pixelSize: Theme.fontSizeLarge
-                                    font.weight: Font.Bold
-                                }
-
-                                StyledText {
-                                    Layout.fillWidth: true
-
-                                    text: BatteryService.batteryStatus
-                                    font.pixelSize: Theme.fontSizeLarge
-                                }
+                            StyledText {
+                                text: Math.round(BatteryService.batteryLevel) + "%"
+                                font.pixelSize: Theme.fontSizeLarge
+                                font.weight: Font.Bold
                             }
 
                             StyledText {
                                 Layout.fillWidth: true
-
-                                text: BatteryService.formatTimeRemaining() + " remaining"
+                                text: root.statusText
                                 font.pixelSize: Theme.fontSizeSmall
                                 opacity: 0.7
-
-                                visible: !BatteryService.isPluggedIn && !(BatteryService.formatTimeRemaining() === "Unknown")
+                                elide: Text.ElideRight
                             }
-
-                            StyledText {
-                                Layout.fillWidth: true
-
-                                text: BatteryService.formatTimeRemaining() + " to full"
-                                font.pixelSize: Theme.fontSizeSmall
-                                opacity: 0.7
-
-                                visible: BatteryService.isPluggedIn && !(BatteryService.formatTimeRemaining() === "Unknown")
-                            }
-                        }
-
-                        DankActionButton {
-                            iconName: "Close"
-                            onClicked: root.closePopout()
                         }
                     }
 
-                    // Stats cards
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: Theme.spacingM
 
                         Repeater {
-                            model: statsModel
+                            model: root.stats
 
                             StyledRect {
+                                required property var modelData
+
                                 Layout.fillWidth: true
                                 Layout.minimumWidth: 90
                                 Layout.preferredHeight: 90
-
                                 color: Theme.surfaceContainerHighest
                                 radius: Theme.cornerRadius
-
                                 border.width: 1
                                 border.color: Theme.surfaceContainerHigh
 
@@ -363,49 +301,44 @@ PluginComponent {
                                         text: modelData.label
                                         font.pixelSize: Theme.fontSizeSmall
                                         color: Theme.primary
-                                        Layout.alignment: Text.AlignHCenter
+                                        Layout.alignment: Qt.AlignHCenter
                                     }
 
                                     StyledText {
                                         text: modelData.value
                                         font.pixelSize: Theme.fontSizeLarge
                                         font.weight: Font.Bold
-                                        Layout.alignment: Text.AlignHCenter
+                                        Layout.alignment: Qt.AlignHCenter
                                     }
                                 }
                             }
                         }
                     }
 
-                    // Power profile selector
-                    DankButtonGroup {
-                        id: profileButtonGroup
+                    DButtonGroup {
+                        readonly property var profiles: PowerProfileWatcher.availableProfiles
 
-                        property var profileModel: (typeof PowerProfiles !== "undefined") ? [PowerProfile.PowerSaver, PowerProfile.Balanced].concat(PowerProfiles.hasPerformanceProfile ? [PowerProfile.Performance] : []) : [PowerProfile.PowerSaver, PowerProfile.Balanced, PowerProfile.Performance]
-                        property int currentProfileIndex: {
-                            if (typeof PowerProfiles === "undefined")
-                                return 1;
-                            return profileModel.findIndex(profile => root.isActiveProfile(profile));
-                        }
-
-                        model: profileModel.map(profile => Theme.getPowerProfileLabel(profile))
-                        currentIndex: currentProfileIndex
+                        Layout.fillWidth: true
+                        fillWidth: true
+                        visible: PowerProfileWatcher.available
+                        model: profiles.map(profile => Theme.getPowerProfileLabel(profile))
+                        currentIndex: profiles.indexOf(PowerProfileWatcher.currentProfile)
                         selectionMode: "single"
                         onSelectionChanged: (index, selected) => {
-                            if (!selected)
-                                return;
-                            root.setProfile(profileModel[index]);
+                            if (selected)
+                                root.setProfile(profiles[index]);
                         }
                     }
-                    
-                    // Charge limit
-                    ColumnLayout {
-                        spacing: Theme.spacingL
-                        visible: showChargeLimit
 
-                        // Header
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: Theme.spacingL
+                        visible: root.showChargeLimit
+
                         RowLayout {
-                            DankIcon {
+                            spacing: Theme.spacingS
+
+                            DIcon {
                                 name: "battery_change"
                                 size: Theme.iconSize
                             }
@@ -415,77 +348,83 @@ PluginComponent {
                                 font.pixelSize: Theme.fontSizeMedium
                                 font.weight: Font.Bold
                             }
-
-                            DankActionButton {
-                                iconName: "rotate_right"
-                                onClicked: {
-                                    root.getHardwareChargeLimit();
-                                }
-                                tooltipText: "Get current hardware charge limit"
-                            }
                         }
 
-                        // Charge limit mode
-                        DankButtonGroup {
-                            id: chargeLimitModeButtonGroup
-
+                        DButtonGroup {
+                            Layout.fillWidth: true
+                            fillWidth: true
                             model: ["Preset", "Custom"]
-                            currentIndex: root.chargeLimitCustom ? 1 : 0
+                            currentIndex: root.customMode ? 1 : 0
                             selectionMode: "single"
                             onSelectionChanged: (index, selected) => {
-                                if (!selected) 
-                                    return;
-                                root.chargeLimitCustom = index === 1;
+                                if (selected)
+                                    root.limitMode = index === 1 ? "custom" : "preset";
                             }
                         }
 
-                        // Preset charge limit selector
-                        DankButtonGroup {
-                            id: chargeLimitButtonGroup
-
-                            visible: !root.chargeLimitCustom
-
-                            property var limitModel: [60, 70, 80, 90, 100]
-
-                            model: limitModel.map(limit => limit + "%")
-                            currentIndex: {
-                                return limitModel.indexOf(root.chargeLimit);
-                            }
+                        DButtonGroup {
+                            Layout.fillWidth: true
+                            fillWidth: true
+                            checkEnabled: false
+                            visible: !root.customMode
+                            enabled: !root.busy
+                            model: root.presets.map(limit => limit + "%")
+                            currentIndex: root.presets.indexOf(root.shownLimit)
                             selectionMode: "single"
                             onSelectionChanged: (index, selected) => {
-                                if (!selected) return;
-
-                                root.chargeLimitCustom = false;
-                                root.setHardwareChargeLimit(limitModel[index]);
+                                if (selected && root.presets[index] !== root.shownLimit)
+                                    root.setChargeLimit(root.presets[index]);
                             }
                         }
 
-                        // Custom charge limit
                         RowLayout {
                             spacing: Theme.spacingL
-                            visible: root.chargeLimitCustom
+                            visible: root.customMode
 
-                            DankTextField {
-                                id: chargeLimitTextField
-                                text: root.chargeLimit
-                                placeholderText: "Limit"
-                            }
+                            DTextField {
+                                id: customLimitField
 
-                            DankButton {
-                                text: "Apply"
-                                iconName: "Check"
+                                readonly property int value: parseInt(text)
+                                readonly property bool valid: value >= root.minimumLimit && value <= 100
 
-                                onClicked: {
-                                    if (chargeLimitTextField.text === "" || chargeLimitTextField.text === null) {
-                                        return;
-                                    }
-                                    root.setHardwareChargeLimit(chargeLimitTextField.text.replace("%", ""));
+                                Layout.preferredWidth: 120
+                                text: root.shownLimit > 0 ? String(root.shownLimit) : ""
+                                placeholderText: root.minimumLimit + "–100"
+                                validator: IntValidator {
+                                    bottom: 0
+                                    top: 100
+                                }
+                                isError: text !== "" && !valid
+                                onAccepted: {
+                                    if (valid && value !== root.chargeLimit && !root.busy)
+                                        root.setChargeLimit(value);
+                                }
 
-                                    if ([60, 70, 80, 90, 100].includes(parseInt(chargeLimitTextField.text))) {
-                                        root.chargeLimitCustom = false;
+                                Connections {
+                                    target: root
+                                    function onShownLimitChanged() {
+                                        if (root.shownLimit > 0)
+                                            customLimitField.text = String(root.shownLimit);
                                     }
                                 }
                             }
+
+                            DButton {
+                                text: "Apply"
+                                iconName: "check"
+                                busy: root.busy
+                                enabled: customLimitField.valid && customLimitField.value !== root.chargeLimit && !root.busy
+                                onClicked: root.setChargeLimit(customLimitField.value)
+                            }
+                        }
+
+                        StyledText {
+                            Layout.fillWidth: true
+                            visible: root.limitError !== ""
+                            text: root.limitError
+                            color: Theme.error
+                            font.pixelSize: Theme.fontSizeSmall
+                            wrapMode: Text.WordWrap
                         }
                     }
                 }
@@ -494,5 +433,4 @@ PluginComponent {
     }
 
     popoutWidth: 450
-    popoutHeight: 500
 }
